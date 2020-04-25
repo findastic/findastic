@@ -1,0 +1,2011 @@
+<?php
+// Set the solr schema version that findastic requires.
+define('FINDASTIC_SCHEMA_VERSION', '3.1');
+
+/**
+ * Implements hook_init().
+ */
+function findastic_init() {
+  // The following code bypass all the drupal menu system in order
+  // to achieve better performance for instant-search.
+  if ($_GET['q'] == 'instant-search' and isset($_GET['text'])) {
+    unset($_GET['_']);
+    $query = array('search' => check_plain($_GET['text']));
+    $sort = findastic_sort_default();
+    $settings = array();
+
+    if (isset($_GET['items_per_page'])) {
+      $_GET['items_per_page'] = preg_replace("/[^0-9]/", "", $_GET['items_per_page']);
+    }
+
+    $items_per_page = isset($_GET['items_per_page']) ? check_plain($_GET['items_per_page']) : variable_get('findastic_instant_search_items_per_page', 12);
+    $settings['start'] = isset($_GET['page']) ? check_plain($_GET['page']) * $items_per_page : 0;
+    $settings['rows'] = $items_per_page;
+    foreach(findastic_sort_settings() as $key => $value) {
+      if ($sort == $key) {
+        $settings['sort'] = $value['query'];
+      }
+    }
+    $time_start = microtime(TRUE);
+    $result = findastic_service()->search($query, $settings);
+    $time_stop = microtime(TRUE);
+    $solr_time = $time_stop - $time_start;
+    $solr_time = round($solr_time * 1000, 2) . 'ms';
+    $response['solr_time'] = $solr_time;
+    $result->path = $_GET['q'];
+    $variables = array();
+
+    // Page components.
+    foreach (ctools_get_plugins('findastic', 'components') as $name => $component) {
+      if ($class = ctools_plugin_get_class($component, 'handler')) {
+        $variables[$name] = new $class($result, $query);
+      }
+    }
+
+    if (variable_get('findastic_facets_in_instant_search', FALSE)) {
+      $variables['total'] = $variables['results']->total;
+      $context = array('result' => clone $result);
+
+      $allowed_facets = array();
+
+      drupal_alter('findastic_search_allowed_facets', $allowed_facets, $context);
+
+      $variables['facets'] = array();
+      if (!empty($allowed_facets)) {
+
+        foreach ($allowed_facets as $field_name => $label) {
+          $field = findastic_get_field_by_name($field_name);
+
+          if ($field and $field->facet) {
+            if ($field->widget->plugin['name'] == 'links') {
+              $default_facets = $result->facets_default[$field_name];
+
+              $data = array();
+              foreach ($result->facets[$field_name] as $value => $num) {
+                if ($num > 0) {
+                  if (array_key_exists($value, $default_facets)) {
+                    $data[] = array(
+                      // Title
+                      't' => $value,
+                      // URL
+                      'u' => ($num > 0) ? url($result->path, array('query' => $field->widget->facetURL($value))) : '#',
+                      // NUM
+                      'n' => $num,
+                      // Checked
+                      'c' => (bool) in_array($value, $field->widget->value),
+                      // Term identifier
+                      'i' => $field_name . '-' . str_replace("-", " ", strtolower(transliteration_get($value))),
+                      // Value
+                      'v' => _findastic_transliteration($value),
+                    );
+                  }
+                }
+              }
+
+              if (!empty($data)) {
+                foreach ($data as $key => $value) {
+                  if ($value['n'] <= 0) {
+                    unset($data[$key]);
+                  }
+                }
+
+                $variables['facets'][] = array(
+                  'id' => $field->id,
+                  'label' => $label,
+                  'name' => $field->name,
+                  'type' => $field->widget->plugin['name'],
+                  'data' => $data,
+                );
+              }
+            } elseif ($field->widget->plugin['name'] == 'slider') {
+              $data = $field->widget->json($result);
+
+              if (!($data['min'] == 0 && $data['max'] == 0)) {
+                $data['thousands_separator'] = $field->widget->thousands_separator;
+                $data['step'] = $field->widget->step;
+                $data['decimals'] = $field->widget->decimals;
+                $data['decimals_separator'] = $field->widget->decimals_separator;
+                $data['display_suffix'] = $field->widget->display_suffix;
+                $data['fromText'] = t('From');
+                $data['toText'] = t('To');
+                $data['display_suffix'] = $field->widget->display_suffix;
+                $data['values'] = '[' . implode(',', $data['values']) . ']';
+
+                if (!empty($data)) {
+                  $variables['facets'][] = array(
+                    'id' => $field->id,
+                    'label' => $label,
+                    'name' => $field->name,
+                    'type' => $field->widget->plugin['name'],
+                    'data' => $data,
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Get page title.
+    $variables['title'] = drupal_get_title();
+
+    // Empty text.
+    $variables['empty'] = t('No results found.');
+
+    // Allow other modules to alter or add anything to findastic variables
+    // before try to render it.
+    drupal_alter('findastic', $variables, $result, $query);
+
+    $scripts = drupal_add_js();
+    if (isset($scripts['settings']['data'])) {
+      foreach ($scripts['settings']['data'] as $key => $value) {
+        if (isset($value['colorbox'])) {
+          unset($scripts['settings']['data'][$key]);
+        }
+        if (isset($value['autologout'])) {
+          unset($scripts['settings']['data'][$key]);
+        }
+      }
+
+      $response['settings'] = drupal_array_merge_deep_array($scripts['settings']['data']);
+    }
+
+    $response['data'] = $variables;
+    drupal_add_http_header('Content-Type', 'application/json; charset=utf-8');
+    print json_encode($response);
+    ajax_footer();
+    exit;
+  }
+
+  $locale = token_replace('[site:og-locale]');
+  $locale = str_replace('_', '-', $locale);
+
+  drupal_add_js(array('findastic' =>
+    array(
+      'voice_search_enabled' => variable_get('findastic_voice_search_enabled', TRUE),
+      'voice_search_language' => empty($locale) ? 'el-GR' : $locale,
+      'findastic_separator' => variable_get('findastic_separator', '-and-'),
+      'findastic_facets_in_instant_search' => variable_get('findastic_facets_in_instant_search', FALSE),
+      'findastic_module_path' => drupal_get_path('module', 'findastic'),
+    )
+  ), 'setting');
+
+  if (variable_get('findastic_facets_in_instant_search', FALSE)) {
+    drupal_add_library('findastic', 'findastic.slider');
+  }
+}
+
+/**
+ * Implements hook_enable().
+ */
+function findastic_enable() {
+  variable_set('search_default_module', 'findastic');
+  variable_set('search_active_modules', array('findastic'));
+}
+
+/**
+ * Implements hook_permission().
+ */
+function findastic_permission() {
+  return array(
+    'administer findastic' =>  array(
+      'title' => t('Administer Findastic'),
+      'description' => t('Perform administration tasks for findastic.'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function findastic_menu() {
+  $items = array();
+
+  $items['ajax/findastic'] = array(
+    'page callback' => 'findastic_ajax',
+    'access callback' => TRUE,
+  );
+
+  $items['admin/structure/findastic'] = array(
+    'title' => t('Findastic'),
+    'page callback' => 'findastic_status_page',
+    'access arguments' => array('administer findastic'),
+    'file' => 'findastic.admin.inc',
+  );
+
+  $items['admin/structure/findastic/status'] = array(
+    'title' => t('Status'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -50,
+  );
+
+  $items['admin/structure/findastic/settings'] = array(
+    'title' => t('Settings'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('findastic_settings_form'),
+    'access arguments' => array('administer findastic'),
+    'file' => 'findastic.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => -49,
+  );
+
+  $items['findastic-index/%/%'] = array(
+    'page callback' => 'findastic_index_entities_callback',
+    'page arguments' => array(1, 2),
+    'type' => MENU_CALLBACK,
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+  );
+
+  $entities = variable_get('findastic_entities', array());
+  if (!empty($entities)) {
+    $items['admin/structure/findastic/fields'] = array(
+      'title' => t('Fields'),
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('findastic_fields_form', key($entities)),
+      'access callback' => 'findastic_admin_fields_access',
+      'access arguments' => array('administer findastic'),
+      'type' => MENU_LOCAL_TASK,
+      'file' => 'findastic.admin.inc',
+      'weight' => -48,
+    );
+
+    $i = 0;
+    foreach ($entities as $entity_type => $bundles) {
+      $info = entity_get_info($entity_type);
+      $admin_entity_path = 'admin/structure/findastic/fields/' . str_replace('_', '-', $entity_type);
+      if ($i == 0) {
+        $items[$admin_entity_path] = array(
+          'title' => $info['label'],
+          'type' => MENU_DEFAULT_LOCAL_TASK,
+          'weight' => $i++,
+        );
+      }
+      else {
+        $items[$admin_entity_path] = array(
+          'title' => $info['label'],
+          'page callback' => 'drupal_get_form',
+          'page arguments' => array('findastic_fields_form', $entity_type),
+          'access callback' => 'findastic_admin_fields_access',
+          'access arguments' => array('administer findastic'),
+          'type' => MENU_LOCAL_TASK,
+          'file' => 'findastic.admin.inc',
+          'weight' => $i++,
+        );
+      }
+
+      $items[$admin_entity_path . '/%/edit'] = array(
+        'title' => t('Edit'),
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('findastic_field_edit_form', 5),
+        'access callback' => 'findastic_admin_fields_access',
+        'access arguments' => array('administer findastic'),
+        'file' => 'findastic.admin.inc',
+      );
+
+      $items[$admin_entity_path . '/%/delete'] = array(
+        'title' => t('Fields'),
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('findastic_field_delete_form', 5),
+        'access callback' => 'findastic_admin_fields_access',
+        'access arguments' => array('administer findastic'),
+        'file' => 'findastic.admin.inc',
+      );
+    }
+
+    // Admin page for sortable fields.
+    $items['admin/structure/findastic/sorts'] = array(
+      'title' => t('Sorts'),
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('findastic_sort_settings_form'),
+      'access callback' => 'findastic_admin_fields_access',
+      'access arguments' => array('administer findastic'),
+      'type' => MENU_LOCAL_TASK,
+      'file' => 'findastic.admin.inc',
+      'weight' => -47,
+    );
+
+    // // Admin page for testing.
+    // $items['admin/structure/findastic/test'] = array(
+    //   'title' => t('Test'),
+    //   'page callback' => 'drupal_get_form',
+    //   'page arguments' => array('findastic_test_form'),
+    //   'access callback' => 'findastic_admin_fields_access',
+    //   'access arguments' => array('administer findastic'),
+    //   'type' => MENU_LOCAL_TASK,
+    //   'file' => 'findastic.admin.inc',
+    //   'weight' => 50,
+    // );
+  }
+
+  // Findastic custom urls.
+  $items['findastic'] = array(
+    'title' => t('All Products'),
+    'page callback' => 'findastic_page',
+    'type' => MENU_CALLBACK,
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+  );
+
+  $items['findastic/%node_type'] = array(
+    'title callback' => 'findastic_page_title',
+    'title arguments' => array(1),
+    'page arguments' => array(1),
+  ) + $items['findastic'];
+
+  $items['findastic/%node_type/%'] = array(
+    'title callback' => 'findastic_fields_page_title',
+    'title arguments' => array(1),
+    'page callback' => 'findastic_fields_page',
+    'page arguments' => array(1),
+  ) + $items['findastic'];
+
+  return $items;
+}
+
+/**
+ * Ajax callback for findastic.
+ */
+function findastic_ajax() {
+  $response = array();
+
+  // Disable caching for this page.
+  drupal_page_is_cacheable(FALSE);
+
+  // Adds the rel variable to reference the current elements.
+  $response['rel'] = isset($_GET['rel']) ? $_GET['rel'] : '';
+
+  // Replace current path.
+  if (isset($_GET['path'])) {
+    $_SERVER['REQUEST_URI'] = $_GET['path'];
+    $url = drupal_parse_url($_GET['path']);
+    unset($_GET['path']);
+    $_GET = $url['query'];
+    $_REQUEST['q'] = $_GET['q'] = trim($url['path'], '/');
+    drupal_static_reset('drupal_get_destination');
+    drupal_static_reset('element_info');
+  }
+
+  // Execute placeholder.
+  if (isset($_REQUEST['placeholder'])) {
+    foreach ($_REQUEST['placeholder'] as $function => $items) {
+      if (function_exists($function)) {
+        foreach ($items as $args) {
+          ksort($args);
+          $response['replacements'][] = call_user_func_array($function, $args);
+        }
+      }
+    }
+  }
+
+  // Get settings.
+  $scripts = drupal_add_js();
+  if (isset($scripts['settings']['data'])) {
+    $response['settings'] = drupal_array_merge_deep_array($scripts['settings']['data']);
+  }
+
+  print drupal_json_encode($response);
+  drupal_exit();
+}
+
+/**
+ * Renders an entity field.
+ */
+function findastic_entity_view_field($entity_type, $entity_id, $field_name) {
+  $entity_view = &drupal_static(__FUNCTION__);
+
+  if (!isset($entity_view[$entity_type][$entity_id])) {
+    $entities = entity_load($entity_type, array($entity_id));
+    $build = entity_view($entity_type, $entities, 'teaser');
+    $entity_view[$entity_type][$entity_id] = isset($build[$entity_type][$entity_id]) ? $build[$entity_type][$entity_id] : array();
+  }
+
+  return isset($entity_view[$entity_type][$entity_id][$field_name]) ? render($entity_view[$entity_type][$entity_id][$field_name]) : (isset($entities[$entity_id]->{$field_name}) ? $entities[$entity_id]->{$field_name} : '');
+}
+
+/**
+ * Access callback for findastic_fields_form page.
+ */
+function findastic_admin_fields_access($permission) {
+  $entities = variable_get('findastic_entities');
+  return !empty($entities) and user_access($permission);
+}
+
+/**
+ * Title callback for findastic page with fields filter.
+ */
+function findastic_fields_page_title($node_type) {
+  $title = array(t($node_type->name));
+
+  // Only allow taxonomy terms to be used.
+  $fields = array_chunk(array_slice(explode('/', $_GET['q']), 2), 2);
+  foreach($fields as $field) {
+    $info = field_info_field('field_' . $field[0]);
+    if ($info['type'] == 'taxonomy_term_reference') {
+      $term = taxonomy_term_load($field[1]);
+      $title[] = $term->name;
+    }
+  }
+
+  return implode(' ', $title);
+}
+
+/**
+ * Page callback for findastic page with fields filter.
+ */
+function findastic_fields_page($node_type) {
+  $query = array(
+    'entity_type' => 'node',
+    'type' => $node_type->type,
+  );
+
+  // Only allow taxonomy terms to be used.
+  $fields = array_chunk(array_slice(explode('/', $_GET['q']), 2), 2);
+  foreach($fields as $field) {
+    $info = field_info_field('field_' . $field[0]);
+    if ($info['type'] == 'taxonomy_term_reference') {
+      $query['tid'][] = $field[1];
+    }
+  }
+
+  return findastic_build_page($query);
+}
+
+/**
+ * Title callback for default findastic page.
+ */
+function findastic_page_title($node_type) {
+  return t($node_type->name);
+}
+
+/**
+ * Page callback for default findastic page.
+ */
+function findastic_page($node_type = FALSE) {
+  // Get all results.
+  $query = $node_type ? array('entity_type' => 'node', 'bundle' => $node_type->type) : array();
+  return findastic_build_page($query);
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function findastic_menu_alter(&$items) {
+  $items['taxonomy/term/%taxonomy_term']['page callback'] = 'findastic_taxonomy_term_page';
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function findastic_menu_local_tasks_alter(&$data, $router_item, $root_path) {
+  if ($root_path == 'admin/structure/findastic/fields') {
+    $entities = variable_get('findastic_entities', array());
+    $default_path = 'admin/structure/findastic/fields/' . str_replace('_', '-', key($entities));
+    foreach ($data['tabs'][1]['output'] as $index => &$tab) {
+      if ($tab['#link']['path'] == $default_path) {
+        $tab['#active'] = TRUE;
+      }
+    }
+  }
+}
+
+/**
+ * Menu callback for taxonomy pages.
+ */
+function findastic_taxonomy_term_page($term) {
+  // Try to get default sorting from taxonomy term.
+  if (!isset($_GET['sort'])) {
+    $wrapper = entity_metadata_wrapper('taxonomy_term', $term);
+
+    foreach (field_info_field_map() as $field_name => $field) {
+      if ($field['type'] == 'list_findastic_sort') {
+        if (isset($term->{$field_name}) and !empty($term->{$field_name})) {
+          $items = field_get_items('taxonomy_term', $term, $field_name);
+          $_GET['sort'] = $items[0]['value'];
+        }
+      }
+    }
+  }
+
+  // Add metatags to this page.
+  if (module_exists('metatag')) {
+    if ($output = metatag_generate_entity_metatags($term, 'taxonomy_term')) {
+      list($entity_id, $revision_id, $bundle) = entity_extract_ids('taxonomy_term', $term);
+      $instance = "taxonomy_term:{$bundle}";
+      metatag_page_set_metatags($instance, $output);
+    }
+  }
+
+  // Get the results for this taxonomy term.
+  return findastic_build_page(array('tid' => $term->tid));
+}
+
+/**
+ * Implements hook_taxonomy_menu_insert().
+ */
+function findastic_taxonomy_menu_insert(&$item) {
+  if (variable_get('findastic_hide_empty_terms', FALSE)) {
+    if ($result = findastic_service()->search(array('tid' => $item['tid']), array('sort' => 'entity_id asc'))) {
+      if ($result->total == 0) {
+        $item['remove'] = TRUE;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_taxonomy_menu_update().
+ */
+function findastic_taxonomy_menu_update(&$item) {
+  findastic_taxonomy_menu_insert($item);
+}
+
+/**
+ * Implements hook_search_info().
+ */
+function findastic_search_info() {
+  return array(
+    'title' => variable_get('findastic_search_title', 'Products'),
+    'path' => variable_get('findastic_search_path', 'products'),
+    'conditions_callback' => 'findastic_search_conditions_callback',
+  );
+}
+
+/**
+ * Conditions callback for findastic search.
+ */
+function findastic_search_conditions_callback($keys) {
+  return empty($keys) ? array('type' => 'node') : array();
+}
+
+/**
+ * Implements hook_search_access().
+ */
+function findastic_search_access() {
+  return user_access('access content');
+}
+
+/**
+ * Implements hook_search_execute().
+ */
+function findastic_search_execute($keys = NULL, $conditions = NULL) {
+  $query = !empty($keys) ? array('search' => $keys) : array();
+  return findastic_build_page($query);
+}
+
+/**
+ * Implements hook_search_page().
+ */
+function findastic_search_page($results) {
+  return array('#markup' => $results);
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function findastic_form_search_block_form_alter(&$form, &$form_state) {
+  if (isset($form['module'])) {
+    $module = $form['module']['#value'];
+  }
+  else{
+    $module = FALSE;
+  }
+
+  // If not module then get default.
+  if (!$module) {
+    $module_info = search_get_default_module_info();
+    $module = $module_info['module'];
+  }
+  else {
+    $info = search_get_info();
+    $module_info = isset($info[$module]) ? $info[$module] : FALSE;
+  }
+
+  // If findastic search then add the required libraries and classes.
+  if ($module == 'findastic') {
+    // Get current page result.
+    $result = findastic_get_current_page_result();
+
+    $form['#attributes']['class'][] = 'findastic-search';
+    $form['search_block_form']['#attributes']['class'][] = 'instant';
+    $form['#attached']['library'][] = array('findastic', 'findastic');
+    $form['#attached']['js'][] = array(
+      'type' => 'setting',
+      'data' => array(
+        'findastic' => array(
+          'search' => array(
+            'path' => url('search/' . variable_get('findastic_search_path', 'products')),
+            'argument' => (strpos($result->path, "search/") === 0),
+          ),
+        ),
+      ),
+    );
+
+    if (arg(0) == 'search' and arg(1) == $module_info['path']) {
+      $form['search_block_form']['#default_value'] = arg(2);
+    }
+    else if (isset($_GET['search'])) {
+      $form['search_block_form']['#default_value'] = check_plain($_GET['search']);
+    }
+  }
+}
+
+/**
+ * Implementation of hook_libraries_info().
+ */
+function findastic_libraries_info() {
+  $libraries = array();
+  $libraries['twigphp'] = array(
+    'name' => 'Twig',
+    'vendor url' => 'https://github.com/twigphp/Twig',
+    'download url' => 'https://github.com/twigphp/Twig/archive/v1.29.0.zip',
+    'path' => 'lib/Twig',
+    'files' => array(
+      'php' => array(
+        'Autoloader.php',
+      ),
+    ),
+    'version' => '1.29',
+  );
+  return $libraries;
+}
+
+/**
+ * Returns a twig class.
+ */
+function findastic_template($suggestions = array('findastic')) {
+  $twig = &drupal_static(__FUNCTION__);
+
+  if (!isset($twig)) {
+    $twig = FALSE;
+
+    // Load twigphp library.
+    $twig_lib = libraries_load('twigphp');
+
+    // If twig library installed then create a new twig class.
+    if ($twig_lib['installed']) {
+      // Register twig loader.
+      Twig_Autoloader::register();
+
+      // First try to get from default theme and
+      // then use as fallback current module's twig file.
+      $loader = new Twig_Loader_Filesystem();
+      $loader->addPath(drupal_get_path('module', 'findastic') . '/templates');
+      $theme = variable_get('theme_default', 'bartik');
+      if (file_exists(drupal_get_path('theme', $theme) . '/templates')) {
+        $loader->prependPath(drupal_get_path('theme', $theme) . '/templates');
+      }
+
+      // Adds extensions.
+      $twig = new Twig_Environment($loader);
+      $twig->addExtension(new Twig_Extension_Findastic());
+    }
+  }
+
+  // Resolve template.
+  $template = $twig
+    ->resolveTemplate(array_map(function($value) {
+      return $value . '.twig';
+    }, array_reverse($suggestions)));
+
+  return $template;
+}
+
+/**
+ * Implements hook_library().
+ */
+function findastic_library() {
+  $language = clone $GLOBALS['language'];
+  global $theme;
+
+  if ($cache = cache_get('findastic_template')) {
+    $findastic_template = $cache->data;
+  } else {
+    $findastic_template = findastic_template() ? file_get_contents(findastic_template()->getSourceContext()->getPath()) : '';
+    cache_set('findastic_template', $findastic_template, 'cache', CACHE_TEMPORARY);
+  }
+
+  try {
+    $languages = language_list('enabled');
+    foreach ($languages[1] as $langcode => $lang) {
+      $GLOBALS['language'] = $lang;
+      $cache_key = $theme . 'findastic_overlay_search' . $langcode;
+      if ($cache = cache_get($cache_key)) {
+        $findastic_overlay_search[$langcode] = $cache->data;
+      } else {
+        $findastic_overlay_search[$langcode] = theme('findastic_overlay_search');
+        cache_set($cache_key, $findastic_overlay_search[$langcode], 'cache', CACHE_TEMPORARY);
+      }
+    }
+  }
+  finally {
+    $GLOBALS['language'] = $language;
+  }
+
+  if ($cache = cache_get('facets_template')) {
+    $facets_template = $cache->data;
+  } else {
+    $facets_template = findastic_template(array('findastic.facets')) ? file_get_contents(findastic_template(array('findastic.facets'))->getSourceContext()->getPath()) : '';
+    cache_set('facets_template', $facets_template, 'cache', CACHE_TEMPORARY);
+  }
+
+
+  $libraries['findastic'] = array(
+    'title' => t('Findastic'),
+    'version' => '2.x',
+    'js' => array(
+      drupal_get_path('module', 'findastic') . '/assets/vue.js' => array(),
+      drupal_get_path('module', 'findastic') . '/assets/twig.js' => array(),
+      drupal_get_path('module', 'findastic') . '/assets/url.js' => array(),
+      drupal_get_path('module', 'findastic') . '/assets/findastic.js' => array(),
+      drupal_get_path('module', 'findastic') . '/assets/jquery.history.js' => array(),
+      drupal_get_path('module', 'findastic') . '/assets/jquery.ui.touch-punch.min.js' => array(),
+      drupal_get_path('module', 'findastic') . '/assets/findastic.search.js' => array(),
+      array(
+        'type' => 'setting',
+        'data' => array(
+          'findastic' => array(
+            'search_path' => url('search/' . variable_get('findastic_search_path', 'products')),
+            'overlay_markup' => $findastic_overlay_search,
+            'template' => $findastic_template,
+            'facets_template' => $facets_template,
+          ),
+        ),
+      ),
+    ),
+    'css' => array(
+      drupal_get_path('module', 'findastic') . '/assets/findastic.css' => array(),
+    ),
+    'dependencies' => array(
+      array('system', 'ui.widget'),
+    ),
+  );
+
+  $libraries['findastic.slider'] = array(
+    'title' => t('Findastic Slider'),
+    'version' => '2.x',
+    'js' => array(
+      drupal_get_path('module', 'findastic') . '/assets/jquery.ui.touch-punch.min.js' => array(),
+      drupal_get_path('module', 'findastic') . '/assets/findastic.slider.js' => array(),
+      array(
+        'type' => 'setting',
+        'data' => array(
+          'findastic' => array(
+            'slider' => array(
+              'logarithmic' => FALSE,
+            ),
+          ),
+        ),
+      ),
+    ),
+    'dependencies' => array(
+      array('system', 'ui.mouse'),
+      array('system', 'ui.slider'),
+      array('findastic', 'findastic'),
+    ),
+  );
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function findastic_theme($existing, $type, $theme, $path) {
+  return array(
+    'findastic' => array(
+      'variables' => array(
+        'content' => NULL,
+        'result' => NULL,
+        'query' => NULL
+      ),
+      'template' => 'findastic',
+      'path' => drupal_get_path('module', 'findastic') . '/theme',
+    ),
+    'findastic_content_region_wrapper' => array(
+      'render element' => 'element',
+    ),
+    'findastic_form_table' => array(
+      'render element' => 'element',
+    ),
+    'findastic_overlay_search' => array(
+      'template' => 'findastic-overlay-search',
+      'path' => drupal_get_path('module', 'findastic') . '/theme',
+    ),
+  );
+}
+
+/**
+ * Implements hook_element_info().
+ */
+function findastic_element_info() {
+  return array(
+    'findastic_form_table' => array(
+      '#theme' => 'findastic_form_table',
+    ),
+  );
+}
+
+/**
+ * Implements hook_ctools_plugin_type().
+ */
+function findastic_ctools_plugin_type() {
+  return array(
+    'components' => array(
+      'use hooks' => TRUE,
+    ),
+    'fields' => array(
+      'use hooks' => TRUE,
+    ),
+    'widgets' => array(
+      'use hooks' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_findastic_components().
+ */
+function findastic_findastic_components() {
+  return array(
+    'results' => array(
+      'label' => t('Results'),
+      'handler' => array(
+        'class' => 'FindasticResults',
+      ),
+    ),
+    'pager' => array(
+      'label' => t('Pager'),
+      'handler' => array(
+        'class' => 'FindasticPager',
+      ),
+    ),
+    'filters' => array(
+      'label' => t('Filters'),
+      'handler' => array(
+        'class' => 'FindasticFilters',
+      ),
+    ),
+    'sort' => array(
+      'label' => t('Sort'),
+      'handler' => array(
+        'class' => 'FindasticSort',
+      ),
+    ),
+    'items_per_page' => array(
+      'label' => t('Items per page'),
+      'handler' => array(
+        'class' => 'FindasticItemsPerPage',
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_findastic_fields().
+ */
+function findastic_findastic_fields() {
+  return array(
+    'string' => array(
+      'label' => t('Text'),
+      'handler' => array(
+        'class' => 'FindasticFieldString',
+      ),
+    ),
+    'code' => array(
+      'label' => t('Code'),
+      'handler' => array(
+        'class' => 'FindasticFieldCode',
+      ),
+    ),
+    'text' => array(
+      'label' => t('Long text'),
+      'handler' => array(
+        'class' => 'FindasticFieldText',
+      ),
+    ),
+    'integer' => array(
+      'label' => t('Integer'),
+      'handler' => array(
+        'class' => 'FindasticFieldNumber',
+      ),
+    ),
+    'float' => array(
+      'label' => t('Float'),
+      'handler' => array(
+        'class' => 'FindasticFieldFloat',
+      ),
+    ),
+    'boolean' => array(
+      'label' => t('Boolean'),
+      'handler' => array(
+        'class' => 'FindasticFieldBoolean',
+      ),
+    ),
+    'raw' => array(
+      'label' => t('Raw Text'),
+      'handler' => array(
+        'class' => 'FindasticFieldRawText',
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_findastic_widgets().
+ */
+function findastic_findastic_widgets() {
+  return array(
+    'links' => array(
+      'label' => t('Links'),
+      'fields' => array('string', 'boolean', 'float', 'integer'),
+      'handler' => array(
+        'class' => 'FindasticWidgetLinks',
+      ),
+    ),
+    // @todo Enable range widget.
+    // 'range' => array(
+    //   'label' => t('Range'),
+    //   'fields' => array('float', 'integer'),
+    //   'handler' => array(
+    //     'class' => 'FindasticWidgetRange',
+    //   ),
+    // ),
+    'slider' => array(
+      'label' => t('Slider'),
+      'fields' => array('float', 'integer'),
+      'handler' => array(
+        'class' => 'FindasticWidgetSlider',
+      ),
+    ),
+  );
+}
+
+/**
+ * Returns a list of findastic fields.
+ */
+function findastic_field_types() {
+  $types = array();
+
+  foreach (ctools_get_plugins('findastic', 'fields') as $id => $plugin) {
+    $types[$id] = $plugin['label'];
+  }
+
+  return $types;
+}
+
+/**
+ * Returns findastic field by name.
+ */
+function findastic_get_field_by_name($name) {
+  $fields = &drupal_static(__FUNCTION__);
+
+  if (!isset($fields)) {
+    foreach (findastic_get_fields() as $field) {
+      $fields[$field->name] = $field;
+    }
+  }
+
+  return isset($fields[$name]) ? $fields[$name] : FALSE;
+}
+
+/**
+ * Returns all findastic fields.
+ */
+function findastic_get_fields($field_id = FALSE, $reset = FALSE) {
+  $fields = &drupal_static(__FUNCTION__);
+
+  if (!isset($fields)) {
+    $fields = array();
+
+    if (!$reset and $cache = cache_get(__FUNCTION__)) {
+      $items = $cache->data;
+    }
+    else {
+      // Load the field config from the database.
+      $items = db_select('findastic_field_config', 'f')
+        ->fields('f')
+        ->orderBy('f.weight', 'ASC')
+        ->execute()
+        ->fetchAllAssoc('id', PDO::FETCH_ASSOC);
+
+      // Alters findastic fields.
+      drupal_alter('findastic_fields', $items);
+
+      // The cache will be wiped at the next flush all caches.
+      cache_set(__FUNCTION__, $items, 'cache', CACHE_TEMPORARY);
+    }
+
+    // Allow module to exclude facet fields from specific pages.
+    drupal_alter('findastic_page_fields', $items);
+
+    // Include ctools plugins.
+    ctools_include('plugins');
+
+    // Foreach field build the field.
+    foreach ($items as $id => $field) {
+      $plugin = ctools_get_plugins('findastic', 'fields', $field['type']);
+      if ($class = ctools_plugin_get_class($plugin, 'handler')) {
+        $field['data'] = is_array($field['data']) ? $field['data'] : unserialize($field['data']);
+        $fields[$id] = new $class($field);
+      }
+    }
+  }
+
+  // If field_id isset return a specific field.
+  if ($field_id) {
+    return isset($fields[$field_id]) ? $fields[$field_id] : FALSE;
+  }
+
+  return $fields;
+}
+
+/**
+ * Returns the findastic service instance.
+ * We leave it abstract in case we need to test
+ * other search servers in the future.
+ */
+function findastic_service() {
+  // First get the default service class.
+  $class = variable_get('findastic_service_class', 'FindasticSolrService');
+
+  // Return the instance.
+  // Load it as singleton.
+  return $class::getInstance();
+}
+
+/**
+ * Returns TRUE or FALSE whether this entity_type is indexable.
+ */
+function findastic_is_indexable($bundle, $entity_type = 'node') {
+  $entities = variable_get('findastic_entities', array());
+  return isset($entities[$entity_type]) and in_array($bundle, $entities[$entity_type]);
+}
+
+/**
+ * Implements hook_commerce_product_reference_default_delta_alter().
+ */
+function findastic_commerce_product_reference_default_delta_alter(&$delta, $products) {
+  if (isset($GLOBALS['findastic_variation'])) {
+    foreach ($products as $i => $product) {
+      if ($product->status) {
+        $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+        foreach ($GLOBALS['findastic_variation'] as $name => $value) {
+          if (isset($product_wrapper->{$name})) {
+            $product_value = $product_wrapper->{$name}->raw();
+            if ($product_value == $value) {
+              $delta = $i;
+              return TRUE;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Creates a batch process to index nodes.
+ */
+function findastic_index_node_batch($nids) {
+  $batch = array(
+    'operations' => array(),
+    'finished' => 'findastic_index_node_batch_finished',
+    'title' => t('Indexing Nodes'),
+  );
+
+  $chunk = array_chunk($nids, 50);
+  foreach ($chunk as $nids) {
+    $batch['operations'][] = array('findastic_index_node_batch_process', array($nids));
+  }
+
+  return $batch;
+}
+
+/**
+ * Processes batch chunk.
+ */
+function findastic_index_node_batch_process($nids, &$context) {
+  foreach ($nids as $nid) {
+    if ($node = node_load($nid)) {
+      findastic_entity_insert($node, 'node');
+    }
+  }
+  $context['finished'] = 1;
+}
+
+/**
+ * On batch finish.
+ */
+function findastic_index_node_batch_finished($success, $results, $operations) {
+  drupal_set_message(t('All nodes have been indexed.'));
+}
+
+/**
+ * Page callback for indexing entities.
+ */
+function findastic_index_entities_callback($entity_type, $ids) {
+  $ids = explode('-', $ids);
+  $result = array();
+
+  foreach ($ids as $entity_id) {
+    try {
+      if ($document = findastic_index_entity($entity_type, $entity_id)) {
+        $result[$entity_type][$entity_id]['status'] = TRUE;
+      }
+      else {
+        $result[$entity_type][$entity_id]['status'] = FALSE;
+        $result[$entity_type][$entity_id]['message'] = array();
+        if ($messages = drupal_get_messages()) {
+          foreach ($messages as $type => $_messages) {
+            $result[$entity_type][$entity_id]['message'][$type] = implode(', ', $_messages);
+          }
+        }
+      }
+    }
+    catch(Exception $e) {
+      ob_clean();
+      $result[$entity_type][$entity_id]['status'] = FALSE;
+      $result[$entity_type][$entity_id]['message']['error'] = $e->getMessage();
+    }
+  }
+
+  print drupal_json_encode($result);
+  drupal_exit();
+}
+
+/**
+ * Legacy function to index a node.
+ */
+function findastic_index_node($node) {
+  return findastic_index_entity('node', $node);
+}
+
+/**
+ * Detects whether the current script is running in a command-line.
+ */
+function findastic_is_cli() {
+  return (drupal_is_cli() || arg(0) == 'findastic-index');
+}
+
+/**
+ * Indexes a Drupal node using findastic search services.
+ */
+function findastic_index_entity($entity_type, $entity) {
+  $entity = is_object($entity) ? $entity : entity_load_single($entity_type, $entity);
+
+  // Extract bundle.
+  list($entity_id,, $bundle) = entity_extract_ids($entity_type, $entity);
+
+  // If this bundle is not indexable return FALSE.
+  if (!findastic_is_indexable($bundle, $entity_type)) {
+    return FALSE;
+  }
+
+  // Get enabled language list (for multilingual sites).
+  $languages = language_list('enabled');
+  $tmp_language = $GLOBALS['language'];
+
+  // Get field config.
+  $fields = findastic_get_fields();
+
+  // Get wrapper.
+  $wrapper = entity_metadata_wrapper($entity_type, $entity);
+
+  // Get variations.
+  $variations = array();
+  $variations_to_delete = array();
+  $variation_field = FALSE;
+  if (module_exists('commerce')) {
+    foreach ($fields as $field) {
+      if ($field->entity_type != $entity_type) continue;
+      if (!$variation_field and isset($field->data['variation']) and $field->data['variation']) {
+        $variation_field = $field;
+        foreach (commerce_info_fields('commerce_product_reference', $entity_type) as $field_name => $field_info) {
+          if (isset($wrapper->{$field_name})) {
+            foreach ($wrapper->{$field_name} as $product_wrapper) {
+              if (isset($product_wrapper->{$field->info['name']})) {
+                if ($product_wrapper->status->value()) {
+                  $variations[] = $product_wrapper->{$field->info['name']}->raw();
+                }
+                else {
+                  $variations_to_delete[] = $product_wrapper->{$field->info['name']}->raw();
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  $variations_to_delete = drupal_array_diff_assoc_recursive($variations_to_delete, $variations);
+
+  // Delete unpublished variations.
+  if (!empty($variations_to_delete)) {
+    $variations_to_delete = array_unique($variations_to_delete);
+    foreach ($variations_to_delete as $variation) {
+      try {
+        $id = trim($entity_type . '-' . $entity_id . '-' . $variation, '-');
+        findastic_service()->remove($id);
+      }
+      catch (Exception $e) {
+        if (findastic_is_cli()) {
+          drupal_set_message($e->getMessage(), 'error');
+        }
+      }
+    }
+  }
+
+  // Set at least one variation.
+  $variations = !empty($variations) ? array_unique($variations) : array('');
+
+  // Index/Update published variations.
+  foreach ($variations as $variation) {
+    // Build the document.
+    $document = new stdClass();
+    $document->id = trim($entity_type . '-' . $entity_id . '-' . $variation, '-');
+    $document->entity_type = $entity_type;
+    $document->entity_id = $entity_id;
+    $document->bundle = $bundle;
+    $document->status = isset($entity->status) ? $entity->status : TRUE;
+
+    // Index referenced taxonomy terms.
+    $document->tid = array();
+    $excluded_taxonomy_fields = array_filter(explode(',', variable_get('findastic_excluded_taxonomy_term_fields', 'field_related_category')));
+    foreach (field_info_instances($entity_type, $bundle) as $field_name => $instance) {
+      $field = field_info_field($field_name);
+      if ($field['type'] == 'taxonomy_term_reference' and $wrapper->__isset($field_name) and !in_array($field_name, $excluded_taxonomy_fields)) {
+        $tids = $wrapper->{$field_name}->raw();
+        if (!empty($tids)) {
+          $tids = is_array($tids) ? $tids : array($tids);
+          $document->tid = array_merge($document->tid, $tids);
+        }
+      }
+    }
+
+    // Set a temp global flag for indexing.
+    $GLOBALS['findastic_indexing'] = $entity_id;
+
+    // Add variation to globals.
+    if ($variation_field) {
+      $GLOBALS['findastic_variation'][$variation_field->info['name']] = $variation;
+    }
+
+    // Foreach enabled language.
+    foreach ($languages[1] as $language) {
+      // Change the content language to the current language.
+      $GLOBALS['language_url'] = $GLOBALS['language'] = $GLOBALS['language_content'] = $language;
+
+      // Reset language cache.
+      drupal_static_reset('entity_get_controller');
+      drupal_static_reset('field_language');
+      drupal_static_reset('language_fallback_get_candidates');
+      drupal_static_reset('title_entity_sync');
+      drupal_static_reset('title_active_language');
+
+      // Reload the entity ignoring the cache.
+      $translated_entity = current(entity_load($entity_type, array($entity_id), NULL, TRUE));
+
+      // Create a entity metadata wrapper.
+      $wrapper = entity_metadata_wrapper($entity_type, $translated_entity);
+
+      // Foreach index field.
+      foreach ($fields as $field) {
+        if ($field->entity_type != $entity_type) continue;
+
+        // Resets the cache of the field
+        // in order to change language properly.
+        $field->reset();
+
+        try {
+          if ($variation_field and $variation_field->name == $field->name) {
+            $term = !empty($variation) ? taxonomy_term_load($variation)->name : NULL;
+            $document->{$field->indexName} = array($term);
+          }
+          else if ($value = $field->render($wrapper)) {
+            $document->{$field->indexName} = $value;
+          }
+        }
+        catch (Exception $e) {
+          if (findastic_is_cli()) {
+            drupal_set_message($e->getMessage(), 'error');
+          }
+        }
+      }
+    }
+
+    // Remove global flag.
+    unset($GLOBALS['findastic_indexing']);
+
+    // Build a context.
+    $context = array(
+      'entity_type' => $entity_type,
+      'bundle' => $bundle,
+      'entity' => $entity,
+    );
+
+    // Allow other modules to alter the document before indexing it.
+    drupal_alter('findastic_document', $document, $context);
+
+    // We use this condition to allow other modules to skip specific documents.
+    if ($document) {
+      // Try to index the document.
+      try {
+        findastic_service()->index($document);
+      }
+      catch (Exception $e) {
+        if (findastic_is_cli()) {
+          drupal_set_message($e->getMessage(), 'error');
+        }
+      }
+    }
+    else if (findastic_is_cli()) {
+      drupal_set_message(t('Skip indexing.'), 'warning');
+    }
+  }
+
+  // Restore the default language.
+  $GLOBALS['language_url'] = $GLOBALS['language'] = $GLOBALS['language_content'] = $tmp_language;
+
+  return $document;
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function findastic_entity_insert($entity, $entity_type) {
+  list(,, $bundle) = entity_extract_ids($entity_type, $entity);
+  if (findastic_is_indexable($bundle, $entity_type) and !variable_get('findastic_skip_indexing', FALSE)) {
+    // Use default theme instead of admin.
+    $original_theme = $GLOBALS['theme'];
+    $original_css = drupal_static('drupal_add_css');
+    $original_js = drupal_static('drupal_add_js');
+    $original_library = drupal_static('drupal_add_library');
+    $custom_theme = &drupal_static('menu_get_custom_theme');
+    $custom_theme = variable_get('theme_default', 'bartik');
+    unset($GLOBALS['theme']);
+    drupal_static_reset('theme_get_registry');
+    theme_get_registry(FALSE);
+
+    // As anonymous.
+    $findastic_index = &drupal_static('findastic_index');
+    $findastic_index = TRUE;
+    $original_user = $GLOBALS['user'];
+    try {
+      $GLOBALS['user'] = drupal_anonymous_user();
+      drupal_static_reset('user_access');
+
+      // Index entity.
+      findastic_index_entity($entity_type, $entity);
+
+      // Restore theme.
+      $custom_theme = $original_theme;
+      unset($GLOBALS['theme']);
+      drupal_static_reset('findastic_index');
+      drupal_static_reset('theme_get_registry');
+      $css = &drupal_static('drupal_add_css');
+      $js = &drupal_static('drupal_add_js');
+      $library = &drupal_static('drupal_add_library');
+      $css = $original_css;
+      $js = $original_js;
+      $library = $original_library;
+      theme_get_registry(FALSE);
+    } finally {
+      // Restore user.
+      $GLOBALS['user'] = $original_user;
+      drupal_static_reset('user_access');
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function findastic_entity_update($entity, $entity_type) {
+  findastic_entity_insert($entity, $entity_type);
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function findastic_entity_delete($entity, $entity_type) {
+  list($entity_id,, $bundle) = entity_extract_ids($entity_type, $entity);
+  if (findastic_is_indexable($bundle, $entity_type)) {
+    findastic_service()->remove($entity_type . '-' . $entity_id);
+  }
+}
+
+/**
+ * Returns the sort settings.
+ * @todo Review this.
+ */
+function findastic_sort_settings() {
+  $sort = &drupal_static(__FUNCTION__);
+
+  if (!isset($sort)) {
+    $sort = array();
+
+    $direction = array(
+      'asc' => 'Ascending',
+      'desc' => 'Descending',
+    );
+
+    foreach (findastic_get_fields() as $field) {
+      if ($field->sortable) {
+        $default = FALSE;
+        foreach ($direction as $dir => $dir_label) {
+          $sort_settings = isset($field->sort[$dir]) ? $field->sort[$dir] : array(
+            'title' => "{$field->label} ($dir_label)",
+            'status' => FALSE,
+            'default' => FALSE,
+          );
+          $default = $default || $sort_settings['default'];
+
+          if ($sort_settings['status']) {
+            $sort_settings['query'] = $field->sortName . ' ' . $dir;
+            $sort[$field->name . '_' . $dir] = $sort_settings;
+          }
+        }
+      }
+    }
+
+    if (!empty($sort)) {
+      // Order by weight.
+      uasort($sort, 'drupal_sort_weight');
+
+      // If no default value then select the first one.
+      if (!$default) {
+        reset($sort);
+        $first = key($sort);
+        $sort[$first]['default'] = TRUE;
+      }
+    }
+  }
+
+  return $sort;
+}
+
+/**
+ * Returns the default sort.
+ * @todo Review this.
+ */
+function findastic_sort_default() {
+  $default_sort = &drupal_static(__FUNCTION__);
+
+  if (!isset($default_sort)) {
+    foreach (findastic_sort_settings() as $key => $value) {
+      if ($value['default']) {
+        $default_sort = $key;
+      }
+    }
+  }
+
+  return $default_sort;
+}
+
+/**
+ * Returns the allowed items_per_page options.
+ */
+function findastic_items_per_page_options() {
+  $options = &drupal_static(__FUNCTION__);
+
+  if (!isset($options)) {
+    $_options = variable_get('findastic_items_per_page_options', '20, 50');
+    $_options = drupal_explode_tags($_options);
+    foreach ($_options as $option) {
+      $options[$option] = $option;
+    }
+  }
+
+  return $options;
+}
+
+/**
+ * Builds a findastic page.
+ */
+function findastic_build_page($query = array()) {
+  $result = &drupal_static(__FUNCTION__);
+
+  // Build the settings array.
+  $settings = array();
+  $items_per_page_options = findastic_items_per_page_options();
+
+  if (isset($_GET['items_per_page'])) {
+    $_GET['items_per_page'] = preg_replace("/[^0-9]/", "", $_GET['items_per_page']);
+  }
+
+  $items_per_page = (isset($_GET['items_per_page']) and in_array($_GET['items_per_page'], $items_per_page_options)) ? check_plain($_GET['items_per_page']) : variable_get('findastic_items_per_page', 20);
+  $settings['start'] = isset($_GET['page']) ? check_plain($_GET['page']) * $items_per_page : 0;
+  $settings['rows'] = $items_per_page;
+
+  // Get sorting.
+  $sort = isset($_GET['sort']) ? $_GET['sort'] : findastic_sort_default();
+  foreach(findastic_sort_settings() as $key => $value) {
+    if ($sort == $key) {
+      $settings['sort'] = $value['query'];
+    }
+  }
+
+  // Add search in the query.
+  if (isset($_GET['search'])) {
+    $query['search'] = check_plain($_GET['search']);
+  }
+
+  // Execute search.
+  $result = findastic_service()->search($query, $settings);
+  $result->path = $_GET['q'];
+
+  // Include ctools plugins.
+  ctools_include('plugins');
+
+  // Build the response variables.
+  $variables = array();
+
+  // Build json response for facets.
+  foreach (findastic_get_fields() as $field) {
+    if ($field->facet) {
+      $variables['facets'][$field->id] = $field->widget->json($result);
+    }
+  }
+
+  // Page components.
+  foreach (ctools_get_plugins('findastic', 'components') as $name => $component) {
+    if ($class = ctools_plugin_get_class($component, 'handler')) {
+      $variables[$name] = new $class($result, $query);
+    }
+  }
+
+  // Get page title.
+  $variables['title'] = drupal_get_title();
+
+  // Empty text.
+  $variables['empty'] = t('No results found.');
+
+  // Add default theme hook suggestions.
+  $variables['theme_hook_suggestions'] = array('findastic');
+
+  drupal_add_js(array('findastic' => array('scroll_to_top' => variable_get('findastic_auto_scroll_to_top', TRUE))), 'setting');
+
+  // Allow other modules to alter or add anything to findastic variables
+  // before try to render it.
+  drupal_alter('findastic', $variables, $result, $query);
+
+  if (isset($_SERVER['HTTP_X_REQUESTED_WITH']) and strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) == 'xmlhttprequest' and isset($_GET['_'])) {
+    unset($_GET['_']);
+    drupal_add_http_header('Content-Type', 'application/json; charset=utf-8');
+
+    $scripts = drupal_add_js();
+    if (isset($scripts['settings']['data'])) {
+      $response['settings'] = drupal_array_merge_deep_array($scripts['settings']['data']);
+    }
+
+    $response['data'] = $variables;
+
+    print json_encode($response);
+    ajax_footer();
+    exit;
+  }
+
+  // If library not installed throw an error.
+  if (!findastic_template()) {
+    drupal_set_message(t('Twig library is not loaded.'), 'error');
+    return theme('status_messages');
+  }
+
+  // Return the findastic theme.
+  return theme('findastic', array(
+    'content' => findastic_template($variables['theme_hook_suggestions'])->render($variables),
+    'result' => $result,
+    'query' => $query,
+  ));
+}
+
+/**
+ * Implements hook_page_alter().
+ */
+function findastic_page_alter(&$page) {
+  // Findastic only supported on the front-end.
+  if (!path_is_admin(current_path())) {
+    // Add theme wrapper to the content region.
+    $page['content']['#theme_wrappers'][] = 'findastic_content_region_wrapper';
+  }
+}
+
+/**
+ * Theme wrapper for content region.
+ */
+function theme_findastic_content_region_wrapper($variables) {
+  return '<div id="findastic-wrapper">' . $variables['element']['#children'] . '</div>';
+}
+
+/**
+ * Returns the current page result.
+ * If not in findastic page then return the default result from cache
+ * or recreate this cache and store it to cache for later use.
+ */
+function findastic_get_current_page_result() {
+  $result = &drupal_static('findastic_build_page');
+
+  if (!isset($result)) {
+    $cids = array('findastic_default_result');
+
+    // Allow other modules to alter the cache ids.
+    drupal_alter('findastic_default_result', $cids);
+
+    // Create cache key.
+    $cache_key = implode(':', $cids);
+
+    if ($cache = cache_get($cache_key)) {
+      $result = $cache->data;
+    }
+    else {
+      $query = array();
+      $result = findastic_service()->search($query);
+      $result->path = 'search/' . variable_get('findastic_search_path', 'products');
+      cache_set($cache_key, $result, 'cache', variable_get('page_cache_maximum_age', 21600));
+    }
+  }
+
+  return $result;
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function findastic_block_info() {
+  $blocks = array();
+  // Foreach field.
+  foreach (findastic_get_fields() as $field) {
+    // If the field is facet.
+    if ($field->facet) {
+      $delta = strlen($field->name) > 32 ? substr($field->name, 0, 32) : $field->name;
+
+      // Create a facet block.
+      $blocks[$delta] = array(
+        'info' => t('Findastic facet: @name', array('@name' => $field->label)),
+        'cache' => DRUPAL_CACHE_PER_PAGE,
+      );
+    }
+  }
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function findastic_block_view($delta = '') {
+  $block = array();
+
+  // Foreach facet build it's content.
+  foreach (findastic_get_fields() as $field) {
+    // If the field is facet.
+    if ($field->facet) {
+      $name = strlen($field->name) > 32 ? substr($field->name, 0, 32) : $field->name;
+      if ($delta == $name) {
+        $block['subject'] = t($field->label);
+
+        $result = findastic_get_current_page_result();
+        $block['content'] = $field->widget->render($result);
+      }
+    }
+  }
+
+  return $block;
+}
+
+/**
+ * Implements hook_preprocess_block().
+ */
+function findastic_preprocess_block(&$variables) {
+  if ($variables['block']->module == 'findastic') {
+    $suggestions = array();
+    $suggestions[] = 'findastic_block';
+    $suggestions[] = 'findastic_block__' . $variables['block']->delta;
+    $variables['theme_hook_suggestions'] = array_merge($suggestions, $variables['theme_hook_suggestions']);
+  }
+}
+
+/**
+ * Implements hook_forms().
+ */
+function findastic_forms($form_id, $args) {
+  $forms = array();
+
+  if (strstr($form_id, "findastic_custom_range_form_")) {
+    $forms[$form_id] = array(
+      'callback' => 'findastic_custom_range_form',
+      'callback arguments' => $args,
+    );
+  }
+
+  return $forms;
+}
+
+/**
+ * Custom range form callback.
+ */
+function findastic_custom_range_form($form, &$form_state, $field, $current_min, $current_max, $suffix) {
+  $form_state['no_cache'] = TRUE;
+
+  $form = array(
+    '#attributes' => array(
+      'class' => array('findastic-custom-range'),
+      'data-name' => $field->name,
+    ),
+  );
+
+  $form['min'] = array(
+    '#type' => 'textfield',
+    '#title' => t('From'),
+    '#default_value' => $current_min,
+    '#size' => 3,
+    '#field_suffix' => $suffix,
+    '#attributes' => array(
+      'class' => array('custom-range-min'),
+    ),
+  );
+
+  $form['max'] = array(
+    '#type' => 'textfield',
+    '#title' => t('To'),
+    '#default_value' => $current_max,
+    '#size' => 3,
+    '#field_suffix' => $suffix,
+    '#attributes' => array(
+      'class' => array('custom-range-max'),
+    ),
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function findastic_form_commerce_cart_add_to_cart_form_alter(&$form, $form_state) {
+  // Prepare add to cart form for indexed content.
+  if (isset($GLOBALS['findastic_indexing'])) {
+    $form_state['no_cache'] = TRUE;
+    $form['#action'] = url('node/' . $form_state['context']['entity_id']);
+    $form['form_token'] = array('#markup' => '[form_token:' . $form['#form_id'] . ']');
+  }
+}
+
+/**
+ * Transliterates a string.
+ */
+function _findastic_transliteration($value, $reverse = FALSE) {
+  if(is_numeric($value)) {
+    return $value;
+  }
+
+  $transliteration = &drupal_static(__FUNCTION__);
+  $transliteration_changed = &drupal_static(__FUNCTION__ . '_save', FALSE);
+
+  // If first time then load from cache.
+  if(!isset($transliteration)) {
+    $transliteration = variable_get('findastic_transliteration', array());
+  }
+
+  // If reverse then flip the array.
+  if($reverse) {
+    $transliteration_reverse = array_flip($transliteration);
+    if(isset($transliteration_reverse[$value])) {
+      return $transliteration_reverse[$value];
+    }
+
+    return $value;
+  }
+
+  if(!isset($transliteration[$value])) {
+    module_load_include('inc', 'pathauto', 'pathauto');
+    $transliterated_value = $clean_value = pathauto_cleanstring($value);
+    $i = 1;
+    while (in_array($transliterated_value, $transliteration)) {
+      $transliterated_value = $clean_value . '-' . $i;
+      $i++;
+    }
+    $transliteration[$value] = $transliterated_value;
+    $transliteration_changed = TRUE;
+  }
+
+  return $transliteration[$value];
+}
+
+/**
+ * Implements hook_exit().
+ */
+function findastic_exit() {
+  $transliteration_changed = &drupal_static('_findastic_transliteration_save');
+  if(isset($transliteration_changed) and $transliteration_changed) {
+    $transliteration = drupal_static('_findastic_transliteration');
+    if(isset($transliteration)) {
+      variable_set('findastic_transliteration', $transliteration);
+    }
+  }
+}
+
+/**
+ * Implements hook_features_api().
+ */
+function findastic_features_api() {
+  return array(
+    'findastic_field' => array(
+      'name' => t('Findastic fields'),
+      'default_hook' => 'findastic_default_findastic_fields',
+      'default_file' => FEATURES_DEFAULTS_INCLUDED,
+      'feature_source' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_features_export_options().
+ */
+function findastic_field_features_export_options() {
+  $options = array();
+  foreach (findastic_get_fields() as $identifier => $field) {
+    $options[$field->name] = $field->label;
+  }
+  return $options;
+}
+
+/**
+ * Implements hook_features_export().
+ */
+function findastic_field_features_export($data, &$export, $module_name) {
+  $export['dependencies']['features'] = 'features';
+
+  foreach ($data as $identifier) {
+    $export['features']['findastic_field'][$identifier] = $identifier;
+  }
+
+  return array();
+}
+
+/**
+ * Implements hook_features_export_render().
+ */
+function findastic_field_features_export_render($module, $data, $export = NULL) {
+  $translatables = $code = array();
+  $code = "  \$items = array();\n\n";
+  $schema = drupal_get_schema('findastic_field_config');
+  $keys = array_keys($schema['fields']);
+  foreach ($data as $identifier) {
+    if ($config = findastic_get_field_by_name($identifier)) {
+      $raw_values = $config->raw;
+      unset($raw_values['id']);
+      unset($raw_values['label']);
+      $field_export = features_var_export($raw_values, '  ');
+      $code .= "  \$items['{$identifier}'] = {$field_export};\n";
+    }
+  }
+  $code .= "\n  return \$items;";
+  return array('findastic_default_findastic_fields' => $code);
+}
+
+/**
+ * Implements hook_features_revert().
+ */
+function findastic_field_features_revert($module) {
+  findastic_field_features_rebuild($module);
+}
+
+/**
+ * Implements of hook_features_rebuild().
+ */
+function findastic_field_features_rebuild($module) {
+  if ($fields = features_get_default('findastic_field', $module)) {
+    foreach($fields as $name => $field) {
+      $field['data'] = serialize($field['data']);
+
+      $id = db_select('findastic_field_config', 'f')
+        ->fields('f', array('id'))
+        ->condition('f.name', $name)
+        ->execute()
+        ->fetchField();
+
+      if ($id) {
+        db_update('findastic_field_config')->fields($field)->condition('name', $name)->execute();
+      }
+      else {
+        db_insert('findastic_field_config')->fields($field)->execute();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_info().
+ */
+function findastic_field_info() {
+  return array(
+    'list_findastic_sort' => array(
+      'label' => t('List (findastic sort)'),
+      'description' => t("This field stores a findastic sorting value from a list of options."),
+      'settings' => array(),
+      'default_widget' => 'options_select',
+      'default_formatter' => 'list_default',
+    ),
+    'list_findastic_facet' => array(
+      'label' => t('List (findastic facet)'),
+      'description' => t("This field stores a findastic facet value from a list of options."),
+      'settings' => array(),
+      'default_widget' => 'options_select',
+      'default_formatter' => 'list_default',
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_is_empty().
+ */
+function findastic_field_is_empty($item, $field) {
+  return empty($item['value']);
+}
+
+/**
+ * Implements hook_field_widget_info_alter().
+ */
+function findastic_field_widget_info_alter(&$info) {
+  $info['options_select']['field types'][] = 'list_findastic_sort';
+  $info['options_buttons']['field types'][] = 'list_findastic_sort';
+  $info['options_select']['field types'][] = 'list_findastic_facet';
+  $info['options_buttons']['field types'][] = 'list_findastic_facet';
+}
+
+/**
+ * Implements hook_options_list().
+ */
+function findastic_options_list($field) {
+  $options = array();
+
+  switch ($field['type']) {
+    case 'list_findastic_facet':
+      foreach (findastic_get_fields() as $field) {
+        if ($field->facet) {
+          $options[$field->name] = $field->label;
+        }
+      }
+      break;
+
+    case 'list_findastic_sort':
+      foreach (findastic_sort_settings() as $key => $item) {
+        $options[$key] = $item['title'];
+      }
+      break;
+  }
+
+  return $options;
+}
+
+
+/**
+ * Implements hook_flag_link_type_info_alter().
+ */
+function findastic_flag_link_type_info_alter(&$link_types) {
+  // Needed so we can control the link output by hook_flag_link().
+  $link_types['toggle']['module'] = 'findastic';
+}
+
+/**
+ * Implements hook_flag_link().
+ */
+function findastic_flag_link($flag, $action, $entity_id) {
+  if ($flag->name == 'wishlist' && isset($GLOBALS['findastic_indexing'])) {
+    return array(
+      'title' => '[wishlist:' . $entity_id . ']',
+    );
+  }
+  else {
+    return flag_flag_link($flag, $action, $entity_id);
+  }
+}

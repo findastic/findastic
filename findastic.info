@@ -1,0 +1,33 @@
+name = Findastic
+description = Faceted search for Drupal
+package = Search
+core = 7.x
+
+; Dependencies
+dependencies[] = node
+dependencies[] = entity
+dependencies[] = jquery_update
+dependencies[] = pathauto
+dependencies[] = libraries
+
+; Files
+files[] = plugins/field.inc
+files[] = plugins/fields/boolean.inc
+files[] = plugins/fields/code.inc
+files[] = plugins/fields/float.inc
+files[] = plugins/fields/number.inc
+files[] = plugins/fields/string.inc
+files[] = plugins/fields/text.inc
+files[] = plugins/fields/raw.inc
+files[] = plugins/widget.inc
+files[] = plugins/widgets/links.inc
+files[] = plugins/widgets/range.inc
+files[] = plugins/widgets/slider.inc
+files[] = plugins/component.inc
+files[] = plugins/components/results.inc
+files[] = plugins/components/pager.inc
+files[] = plugins/components/filters.inc
+files[] = plugins/components/sort.inc
+files[] = plugins/components/items_per_page.inc
+files[] = findastic.solr.inc
+files[] = findastic.twig.inc
